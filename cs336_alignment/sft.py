@@ -1,13 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 
-model = AutoModelForCausalLM.from_pretrained(
-    'Qwen/Qwen2.5-Math-1.5B',
-    torch_dtype=torch.bfloat16,
-    attn_implementation='flash_attention_2',
-)
-tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-Math-1.5B')
-
 
 # uv run pytest -k test_tokenize_prompt_and_output
 def tokenize_prompt_and_output(
@@ -31,7 +24,7 @@ def tokenize_prompt_and_output(
             shifted input ids, i.e., the input ids without the first token.
         response_mask 
             torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1): 
-            a mask on the response tokens in the labels
+            a mask on the response tokens in the labels.
     '''
     encoded_prompts = tokenizer(prompt_strs)['input_ids']
     encoded_outputs = tokenizer(output_strs)['input_ids']
@@ -65,6 +58,22 @@ def tokenize_prompt_and_output(
         'labels': labels,
         'response_mask': response_mask
     }
+
+
+# uv run pytest -k test_compute_entropy
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+    '''
+    Get the entropy of the next-token predictions (i.e., entropy over the vocabulary dimension).
+    Args:
+    logits: torch.Tensor Tensor of shape (batch_size, sequence_length, vocab_size)
+        containing unnormalized logits.
+    Returns:
+        torch.Tensor Shape (batch_size, sequence_length). The entropy for each next-token prediction.
+    '''
+    stabilized_logits = logits - logits.max(dim=-1, keepdim=True).values
+    probabilities = stabilized_logits.exp() / stabilized_logits.exp().sum(dim=-1, keepdim=True)
+
+    return -1 * (probabilities * probabilities.log()).sum(dim=-1)
 
 
 if __name__ == '__main__':

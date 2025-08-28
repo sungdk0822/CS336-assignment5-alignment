@@ -65,10 +65,12 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     '''
     Get the entropy of the next-token predictions (i.e., entropy over the vocabulary dimension).
     Args:
-    logits: torch.Tensor Tensor of shape (batch_size, sequence_length, vocab_size)
-        containing unnormalized logits.
+        logits: torch.Tensor 
+            Tensor of shape (batch_size, sequence_length, vocab_size)
+            containing unnormalized logits.
     Returns:
-        torch.Tensor Shape (batch_size, sequence_length). The entropy for each next-token prediction.
+        torch.Tensor 
+            Shape (batch_size, sequence_length). The entropy for each next-token prediction.
     '''
     stabilized_logits = logits - logits.max(dim=-1, keepdim=True).values
     probabilities = stabilized_logits.exp() / stabilized_logits.exp().sum(dim=-1, keepdim=True)
@@ -85,13 +87,17 @@ def get_response_log_probs(
 ) -> dict[str, torch.Tensor]:
     '''
     Args:
-        model: PreTrainedModel HuggingFace model used for scoring (placed on the correct device
+        model: PreTrainedModel 
+            HuggingFace model used for scoring (placed on the correct device
             and in inference mode if gradients should not be computed).
-        input_ids: torch.Tensor shape (batch_size, sequence_length), concatenated prompt +
+        input_ids: torch.Tensor 
+            shape (batch_size, sequence_length), concatenated prompt +
             response tokens as produced by your tokenization method.
-        labels: torch.Tensor shape (batch_size, sequence_length), labels as produced by your
+        labels: torch.Tensor 
+            shape (batch_size, sequence_length), labels as produced by your
             tokenization method.
-        return_token_entropy: bool If True, also return per-token entropy by calling
+        return_token_entropy: bool 
+            If True, also return per-token entropy by calling
             compute_entropy.
     Returns:
         dict[str, torch.Tensor].
@@ -112,6 +118,66 @@ def get_response_log_probs(
         result['token_entropy'] = compute_entropy(logits)
 
     return result
+
+
+# uv run pytest -k test_masked_normalize
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+    normalize_constant: float = 1.0,
+) -> torch.Tensor:
+    '''
+    Args:
+        tensor: torch.Tensor 
+            The tensor to sum and normalize.
+        mask: torch.Tensor 
+            Same shape as tensor; positions with 1 are included in the sum.
+        normalize_constant: float 
+            the constant to divide by for normalization.
+        dim: int | None 
+            the dimension to sum along before normalization. If None, sum over all
+            dimensions.
+    Returns:
+        torch.Tensor 
+            the normalized sum, where masked elements (mask == 0) don't contribute to
+            the sum.
+    '''
+    return (tensor * mask).sum(dim=dim) / normalize_constant
+
+
+# uv run pytest -k test_sft_microbatch_train_step
+def sft_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    '''
+    Args:
+        policy_log_probs 
+            (batch_size, sequence_length), per-token log-probabilities from the
+            SFT policy being trained.
+        response_mask 
+            (batch_size, sequence_length), 1 for response tokens, 0 for prompt/padding.
+        gradient_accumulation_steps 
+            Number of microbatches per optimizer step.
+        normalize_constant 
+            The constant by which to divide the sum. It is fine to leave this as 1.0.
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]].
+            loss 
+                scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
+                this so we can log it.
+            metadata 
+                Dict with metadata from the underlying loss call, and any other statistics you
+                might want to log.
+    '''
+    microbatch_size = policy_log_probs.size(0)
+    batch_size = microbatch_size * gradient_accumulation_steps
+    loss = -1 * masked_normalize(policy_log_probs, response_mask, None, normalize_constant) / batch_size
+    loss.backward()
+    return (loss, {})
 
 
 if __name__ == '__main__':

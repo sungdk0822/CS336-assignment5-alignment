@@ -1,4 +1,5 @@
 import torch
+from typing import Literal
 
 
 # uv run pytest -k test_compute_group_normalized_rewards
@@ -134,3 +135,49 @@ def compute_grpo_clip_loss(
     metadata = {'is_clipped': is_clipped}
 
     return (-torch.minimum(importance_ratio * advantages, clipped_importance_ratio * advantages), metadata)
+
+
+# uv run pytest -k test_compute_policy_gradient_loss
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal['no_baseline', 'reinforce_with_baseline', 'grpo_clip'],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    '''
+    Args:
+        policy_log_probs 
+            (batch_size, sequence_length), per-token log-probabilities from the
+            policy being trained.
+        loss_type 
+            One of 'no_baseline', 'reinforce_with_baseline', or 'grpo_clip'.
+        raw_rewards 
+            Required if loss_type == 'no_baseline'; shape (batch_size, 1).
+        advantages 
+            Required for 'reinforce_with_baseline' and 'grpo_clip'; shape (batch_size, 1).
+        old_log_probs 
+            Required for 'grpo_clip'; shape (batch_size, sequence_length).
+        cliprange 
+            Required for 'grpo_clip'; scalar ε used for clipping.
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            loss 
+                (batch_size, sequence_length), per-token loss.
+            metadata 
+                dict, statistics from the underlying routine (e.g., clip fraction for GRPO-Clip).
+    '''
+    if loss_type == 'no_baseline':
+        assert raw_rewards is not None
+        metadata = {}
+        return (compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), metadata)
+    if loss_type == 'reinforce_with_baseline':
+        assert advantages is not None
+        metadata = {}
+        return (compute_naive_policy_gradient_loss(advantages, policy_log_probs), metadata)
+    if loss_type == 'grpo_clip':
+        assert advantages is not None
+        assert old_log_probs is not None
+        assert cliprange is not None
+        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)

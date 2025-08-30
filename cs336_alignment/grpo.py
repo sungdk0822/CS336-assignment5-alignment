@@ -97,3 +97,40 @@ def compute_naive_policy_gradient_loss(
             be aggregated across the batch and sequence dimensions in the training loop).
     '''
     return -raw_rewards_or_advantages * policy_log_probs
+
+
+# uv run pytest -k test_compute_grpo_clip_loss
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    '''
+    Args:
+        advantages: torch.Tensor 
+            Shape (batch_size, 1), per-example advantages A.
+        policy_log_probs: torch.Tensor 
+            Shape (batch_size, sequence_length), per-token log
+            probs from the policy being trained.
+        old_log_probs: torch.Tensor 
+            Shape (batch_size, sequence_length), per-token log probs
+            from the old policy.
+        cliprange: float 
+            Clip parameter ε (e.g. 0.2).
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            loss 
+                torch.Tensor of shape (batch_size, sequence_length), the per-token clipped loss.
+            metadata 
+                dict containing whatever you want to log. We suggest logging whether each
+                token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
+                the min was lower than the LHS.
+    '''
+    importance_ratio = (policy_log_probs - old_log_probs).exp()
+    clipped_importance_ratio = torch.clamp(importance_ratio, 1 - cliprange, 1 + cliprange)
+
+    is_clipped = importance_ratio * advantages > clipped_importance_ratio * advantages
+    metadata = {'is_clipped': is_clipped}
+
+    return (-torch.minimum(importance_ratio * advantages, clipped_importance_ratio * advantages), metadata)

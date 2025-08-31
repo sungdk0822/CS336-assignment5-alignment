@@ -208,3 +208,75 @@ def masked_mean(
     mean_excluding_zeros = mean_including_zeros * num_all_elements_along_dim / num_included_elements_along_dim
 
     return mean_excluding_zeros
+
+
+# uv run pytest -k test_grpo_microbatch_train_step
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal['no_baseline', 'reinforce_with_baseline', 'grpo_clip'],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    '''
+    Args:
+        policy_log_probs 
+            (batch_size, sequence_length), per-token log-probabilities from the policy being trained.
+        response_mask 
+            (batch_size, sequence_length), 1 for response tokens, 0 for prompt/padding.
+        gradient_accumulation_steps 
+            Number of microbatches per optimizer step.
+        loss_type 
+            One of "no_baseline", "reinforce_with_baseline", "grpo_clip".
+        raw_rewards 
+            Needed when loss_type == "no_baseline"; shape (batch_size, 1).
+        advantages 
+            Needed when loss_type != "no_baseline"; shape (batch_size, 1).
+        old_log_probs 
+            Required for GRPO-Clip; shape (batch_size, sequence_length).
+        cliprange 
+            Clip parameter ε for GRPO-Clip.
+    Returns:
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            loss 
+                scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
+                this so we can log it.
+            metadata 
+                Dict with metadata from the underlying loss call, and any other statistics you
+                might want to log.
+    '''
+    '''
+    from assignment5 pdf p.26:
+        given the raw rewards or advantages and log probs, 
+        we will compute the per-token loss, 
+        use masked_mean to aggregate to a scalar loss per example, 
+        average over the batch dimension, 
+        adjust for gradient accumulation, 
+        and backpropagate.
+    '''
+    # compute the per-token loss
+    per_token_loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs,
+        loss_type,
+        raw_rewards,
+        advantages,
+        old_log_probs,
+        cliprange
+    )
+
+    # use masked_mean to aggregate to a scalar loss per example
+    loss = masked_mean(per_token_loss, response_mask, dim=-1)
+
+    # average over the batch dimension
+    loss = loss.mean(dim=0)
+
+    # adjust for gradient accumulation
+    loss /= gradient_accumulation_steps
+
+    # backpropagate
+    loss.backward()
+
+    return (loss, metadata)

@@ -224,7 +224,7 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
     """
     from cs336_alignment.grpo import masked_mean
     return masked_mean(tensor, mask, dim)
-    
+
 
 def run_sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -274,7 +274,17 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
+    from cs336_alignment.grpo import grpo_microbatch_train_step
+    return grpo_microbatch_train_step(
+        policy_log_probs,
+        response_mask,
+        gradient_accumulation_steps,
+        loss_type,
+        raw_rewards,
+        advantages,
+        old_log_probs,
+        cliprange
+    )
 
 
 def run_masked_normalize(

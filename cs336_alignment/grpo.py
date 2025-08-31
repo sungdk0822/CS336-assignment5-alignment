@@ -181,3 +181,30 @@ def compute_policy_gradient_loss(
         assert old_log_probs is not None
         assert cliprange is not None
         return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+
+
+# uv run pytest -k test_masked_mean
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    '''
+    Args:
+        tensor: torch.Tensor 
+            The data to be averaged.
+        mask: torch.Tensor 
+            Same shape as tensor; positions with 1 are included in the mean.
+        dim: int | None 
+            Dimension over which to average. If None, compute the mean over all
+            masked elements.
+    Returns:
+        torch.Tensor 
+            The masked mean; shape matches tensor.mean(dim) semantics.
+    '''
+    num_included_elements_along_dim = mask.sum(dim)
+    num_all_elements_along_dim = mask.size(dim) if dim is not None else mask.numel()
+    mean_including_zeros = (tensor * mask).mean(dim)
+    mean_excluding_zeros = mean_including_zeros * num_all_elements_along_dim / num_included_elements_along_dim
+
+    return mean_excluding_zeros

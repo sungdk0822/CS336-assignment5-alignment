@@ -293,25 +293,26 @@ def grpo_microbatch_train_step(
 
 
 if __name__ == '__main__':
-    # model_id = 'Qwen/Qwen2.5-Math-1.5B'
-    model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
+    model_id = 'Qwen/Qwen2.5-Math-1.5B'
+    # model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
     time = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     output_dir = f'outputs/{model_id.split('/')[-1]}/{time}'
     os.makedirs(output_dir, exist_ok=True)
 
     n_grpo_steps: int = 200
-    eval_steps: int = 5
+    eval_steps: int = 10
     learning_rate: float = 1e-5
     advantage_eps: float = 1e-6
-    rollout_batch_size: int = 16 # 256
+    rollout_batch_size: int = 256
     group_size: int = 8
     sampling_temperature: float = 1.0
     sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
-    sampling_max_tokens: int = 1024
+    sampling_max_tokens: int = 512
     epochs_per_rollout_batch: int = 1 # On-policy
-    train_batch_size: int = 16 # 256 # On-policy
-    gradient_accumulation_steps: int = 8 # 128 # microbatch size is 2, will fit on H100
-    gpu_memory_utilization: float = 0.3
+    train_batch_size: int = 256 # On-policy
+    micro_eval_batch_size: int = 16
+    gradient_accumulation_steps: int = 128 # microbatch size is 2, will fit on H100
+    gpu_memory_utilization: float = 0.1
     loss_type: Literal[
         'no_baseline',
         'reinforce_with_baseline',
@@ -491,17 +492,17 @@ if __name__ == '__main__':
             accumulated_loss += loss
             metadata = merge_metadata(metadata, temp_metadata, gradient_accumulation_step)
 
-        for key, value in metadata:
-            del metadata[key]
-            metadata['train/' + key] = value
+        train_log = {}
+        for key, value in metadata.items():
+            train_log['train/' + key] = value
 
         if use_wandb: # todo: add gradient norm, token entropy
             wandb.log(
-                metadata, 
+                train_log, 
                 step=step
             )
         else:
-            print(f'step {step}, metadata = {metadata}')
+            print(f'step {step}, train_log = {train_log}')
 
         # todo: use gradient clipping with clip value 1.0
 
@@ -527,18 +528,16 @@ if __name__ == '__main__':
 
         if step % eval_steps == 0:
             eval_metadata = {}
-            for eval_accumulation_step in tqdm(range(num_validation_samples // micro_train_batch_size), desc='eval accumulation'):
+            load_policy_into_vllm_instance(policy, vllm)
+            for eval_accumulation_step in tqdm(range(num_validation_samples // micro_eval_batch_size), desc='eval accumulation'):
                 
                 # todo: modify to perform evaluation on the entire validation set instead of random sampling
                 
                 # sample a batch of questions D_b from D (microbatch version)
-                indices = random.sample(range(num_validation_samples), micro_train_batch_size)
+                indices = random.sample(range(num_validation_samples), micro_eval_batch_size)
                 repeated_indices = [i for i in indices for _ in range(group_size)]
                 repeated_micro_batch_questions = [validation_questions[i] for i in repeated_indices]
                 repeated_micro_batch_answers = [validation_answers[i] for i in repeated_indices]
-
-                # set the old policy model π_θ_old ← π_θ
-                load_policy_into_vllm_instance(policy, vllm)
 
                 # sample G outputs for each question q ∈ D_b
                 outputs = vllm.generate(repeated_micro_batch_questions, sampling_params, use_tqdm=False)
@@ -558,18 +557,18 @@ if __name__ == '__main__':
                 )
 
                 eval_metadata = merge_metadata(eval_metadata, temp_metadata, eval_accumulation_step)
-                
-            for key, value in eval_metadata:
-                del eval_metadata[key]
-                eval_metadata['eval/' + key] = value
+            
+            eval_log = {}
+            for key, value in eval_metadata.items():
+                eval_log['eval/' + key] = value
 
             if use_wandb: # todo: add gradient norm, token entropy
                 wandb.log(
-                    eval_metadata, 
+                    eval_log, 
                     step=step
                 )
             else:
-                print(f'step {step}, eval_metadata = {eval_metadata}')
+                print(f'step {step}, eval_log = {eval_log}')
 
         # todo: periodically save model
 

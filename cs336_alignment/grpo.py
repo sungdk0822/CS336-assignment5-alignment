@@ -1,5 +1,15 @@
+import os
+import random
 import torch
+import wandb
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.sft import tokenize_prompt_and_output, get_response_log_probs
+from cs336_alignment.util import init_vllm, load_policy_into_vllm_instance, get_gsm8k
+from datetime import datetime
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Literal
+from vllm import SamplingParams
 
 
 # uv run pytest -k test_compute_group_normalized_rewards
@@ -132,7 +142,7 @@ def compute_grpo_clip_loss(
     clipped_importance_ratio = torch.clamp(importance_ratio, 1 - cliprange, 1 + cliprange)
 
     is_clipped = importance_ratio * advantages > clipped_importance_ratio * advantages
-    metadata = {'is_clipped': is_clipped}
+    metadata = {'clip_ratio': (is_clipped.sum() / is_clipped.numel()).item()}
 
     return (-torch.minimum(importance_ratio * advantages, clipped_importance_ratio * advantages), metadata)
 
@@ -280,3 +290,289 @@ def grpo_microbatch_train_step(
     loss.backward()
 
     return (loss, metadata)
+
+
+if __name__ == '__main__':
+    # model_id = 'Qwen/Qwen2.5-Math-1.5B'
+    model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
+    time = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+    output_dir = f'outputs/{model_id.split('/')[-1]}/{time}'
+    os.makedirs(output_dir, exist_ok=True)
+
+    n_grpo_steps: int = 200
+    eval_steps: int = 5
+    learning_rate: float = 1e-5
+    advantage_eps: float = 1e-6
+    rollout_batch_size: int = 16 # 256
+    group_size: int = 8
+    sampling_temperature: float = 1.0
+    sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
+    sampling_max_tokens: int = 1024
+    epochs_per_rollout_batch: int = 1 # On-policy
+    train_batch_size: int = 16 # 256 # On-policy
+    gradient_accumulation_steps: int = 8 # 128 # microbatch size is 2, will fit on H100
+    gpu_memory_utilization: float = 0.3
+    loss_type: Literal[
+        'no_baseline',
+        'reinforce_with_baseline',
+        'grpo_clip',
+    ] = 'reinforce_with_baseline'
+    use_std_normalization: bool = True
+    cliprange: float = 0.1
+    use_wandb: bool = True
+    reward_fn = r1_zero_reward_fn
+
+    assert train_batch_size % gradient_accumulation_steps == 0, (
+        'train_batch_size must be divisible by gradient_accumulation_steps'
+    )
+    micro_train_batch_size = train_batch_size // gradient_accumulation_steps
+    assert rollout_batch_size % group_size == 0, (
+        'rollout_batch_size must be divisible by group_size'
+    )
+    n_prompts_per_rollout_batch = rollout_batch_size // group_size
+    assert train_batch_size >= group_size, (
+        'train_batch_size must be greater than or equal to group_size'
+    )
+    n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
+
+    policy = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation='flash_attention_2',
+    )
+    policy_model_device = 'cuda:0'
+    policy.to(policy_model_device)
+    print(f'policy_model_device = {policy.device}')
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
+    )
+
+    vllm = init_vllm(model_id, 'cuda', 2025, gpu_memory_utilization)
+    sampling_params = SamplingParams(
+        temperature=sampling_temperature,
+        top_p=1.0,
+        max_tokens=sampling_max_tokens,
+        min_tokens=sampling_min_tokens,
+        logprobs=0,
+        stop=['</answer>'],
+        include_stop_str_in_output = True
+    )
+
+    train_questions, train_answers = get_gsm8k('r1_zero', 'train')
+    validation_questions, validation_answers = get_gsm8k('r1_zero', 'test')
+    assert len(train_questions) == len(train_answers)
+    assert len(validation_questions) == len(validation_answers)
+    num_train_samples = len(train_questions)
+    num_validation_samples = len(validation_questions)
+    
+    print(num_train_samples)
+    print(num_validation_samples)
+
+    if use_wandb:
+        wandb.login()
+        run = wandb.init(
+            project='cs336-assignment5',
+            name=f'{time}',
+            config={
+                'model_id': model_id,
+                'n_grpo_steps': n_grpo_steps,
+                'learning_rate': learning_rate,
+                'advantage_eps': advantage_eps,
+                'rollout_batch_size': rollout_batch_size,
+                'group_size': group_size,
+                'sampling_temperature': sampling_temperature,
+                'sampling_min_tokens': sampling_min_tokens,
+                'sampling_max_tokens': sampling_max_tokens,
+                'epochs_per_rollout_batch': epochs_per_rollout_batch,
+                'train_batch_size': train_batch_size,
+                'gradient_accumulation_steps': gradient_accumulation_steps,
+                'gpu_memory_utilization': gpu_memory_utilization,
+                'loss_type': loss_type,
+                'use_std_normalization': use_std_normalization,
+                'cliprange': cliprange
+            },
+        )
+        # setup wandb metrics
+        wandb.define_metric("train_step") # the x‑axis for training
+        wandb.define_metric("eval_step") # the x‑axis for evaluation
+        # everything that starts with train/ is tied to train_step
+        wandb.define_metric("train/*", step_metric="train_step")
+        # everything that starts with eval/ is tied to eval_step
+        wandb.define_metric("eval/*", step_metric="eval_step")
+
+    for step in tqdm(range(n_grpo_steps)):
+        accumulated_loss = 0.0
+        metadata = {}
+
+        def merge_metadata(metadata: dict, temp_metadata: dict, step: int):
+            for key, value in temp_metadata.items():
+                if key not in metadata.keys():
+                    metadata[key] = value
+                else:
+                    if 'max' in key:
+                        metadata[key] = max(metadata[key], value)
+                    elif 'min' in key:
+                        metadata[key] = min(metadata[key], value)
+                    elif 'mean' in key:
+                        metadata[key] = (metadata[key] * step + value) / (step + 1)
+                    elif 'std' in key:
+                        metadata[key] = 0.0 # todo: compute std
+                    elif 'ratio' in key:
+                        metadata[key] = (metadata[key] * step + value) / (step + 1)
+
+            return metadata
+
+        for gradient_accumulation_step in range(gradient_accumulation_steps):
+            # sample a batch of questions D_b from D (microbatch version)
+            indices = random.sample(range(num_train_samples), micro_train_batch_size)
+            repeated_indices = [i for i in indices for _ in range(group_size)]
+            repeated_micro_batch_questions = [train_questions[i] for i in repeated_indices]
+            repeated_micro_batch_answers = [train_answers[i] for i in repeated_indices]
+
+            # set the old policy model π_θ_old ← π_θ
+            load_policy_into_vllm_instance(policy, vllm)
+
+            # sample G outputs for each question q ∈ D_b
+            outputs = vllm.generate(repeated_micro_batch_questions, sampling_params, use_tqdm=False)
+            prompts = [output.prompt for output in outputs]
+            responses = [output.outputs[0].text for output in outputs]
+
+            # compute rewards for each sampled output by running reward function
+            # compute advantages with(loss_type == 'grpo_clip') or without(loss_type == 'reinforce_with_baseline') group normalization
+            normalize_by_std = True if loss_type == 'grpo_clip' else False
+            advantages, rewards, temp_metadata = compute_group_normalized_rewards(
+                reward_fn,
+                responses,
+                repeated_micro_batch_answers,
+                group_size,
+                advantage_eps,
+                normalize_by_std
+            )
+            metadata = merge_metadata(metadata, temp_metadata, gradient_accumulation_step)
+
+            if loss_type == 'no_baseline':
+                advantages = None
+            else:
+                rewards = None
+            
+            # compute policy_log_probs
+            result = tokenize_prompt_and_output(prompts, responses, tokenizer)
+            input_ids, labels, response_mask = result['input_ids'], result['labels'], result['response_mask']
+
+            input_ids = input_ids.to(policy_model_device)
+            labels = labels.to(policy_model_device)
+            response_mask = response_mask.to(policy_model_device)
+
+            policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+            advantages = advantages.to(policy_model_device)
+
+            # compute old_log_probs if loss_type == 'grpo_clip'
+            old_log_probs = None
+            if loss_type == 'grpo_clip':
+                with torch.inference_mode():
+                    old_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+
+            advantages.unsqueeze_(-1)
+            loss, temp_metadata = grpo_microbatch_train_step(
+                policy_log_probs,
+                response_mask,
+                gradient_accumulation_steps,
+                loss_type,
+                rewards,
+                advantages,
+                old_log_probs,
+                cliprange
+            )
+
+            accumulated_loss += loss
+            metadata = merge_metadata(metadata, temp_metadata, gradient_accumulation_step)
+
+        for key, value in metadata:
+            del metadata[key]
+            metadata['train/' + key] = value
+
+        if use_wandb: # todo: add gradient norm, token entropy
+            wandb.log(
+                metadata, 
+                step=step
+            )
+        else:
+            print(f'step {step}, metadata = {metadata}')
+
+        # todo: use gradient clipping with clip value 1.0
+
+        # epochs_per_rollout_batch is n_train_steps_per_rollout_batch in p.21 Algorithm 3
+        for train_step in range(epochs_per_rollout_batch):
+            # update the policy model π_θ by maximizing the GRPO-Clip objective
+
+            if train_step != 0:
+                optimizer.zero_grad()
+                # todo: modify to compute over all input_ids and labels, not just those from the last accumulation step
+                policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+                loss, train_step_metadata = compute_policy_gradient_loss(
+                    policy_log_probs,
+                    loss_type,
+                    rewards,
+                    advantages,
+                    old_log_probs,
+                    cliprange
+                )
+                loss.backward()
+
+            optimizer.step()
+
+        if step % eval_steps == 0:
+            eval_metadata = {}
+            for eval_accumulation_step in tqdm(range(num_validation_samples // micro_train_batch_size), desc='eval accumulation'):
+                
+                # todo: modify to perform evaluation on the entire validation set instead of random sampling
+                
+                # sample a batch of questions D_b from D (microbatch version)
+                indices = random.sample(range(num_validation_samples), micro_train_batch_size)
+                repeated_indices = [i for i in indices for _ in range(group_size)]
+                repeated_micro_batch_questions = [validation_questions[i] for i in repeated_indices]
+                repeated_micro_batch_answers = [validation_answers[i] for i in repeated_indices]
+
+                # set the old policy model π_θ_old ← π_θ
+                load_policy_into_vllm_instance(policy, vllm)
+
+                # sample G outputs for each question q ∈ D_b
+                outputs = vllm.generate(repeated_micro_batch_questions, sampling_params, use_tqdm=False)
+                prompts = [output.prompt for output in outputs]
+                responses = [output.outputs[0].text for output in outputs]
+
+                # compute rewards for each sampled output by running reward function
+                # compute advantages with(loss_type == 'grpo_clip') or without(loss_type == 'reinforce_with_baseline') group normalization
+                normalize_by_std = True if loss_type == 'grpo_clip' else False
+                advantages, rewards, temp_metadata = compute_group_normalized_rewards(
+                    reward_fn,
+                    responses,
+                    repeated_micro_batch_answers,
+                    group_size,
+                    advantage_eps,
+                    normalize_by_std
+                )
+
+                eval_metadata = merge_metadata(eval_metadata, temp_metadata, eval_accumulation_step)
+                
+            for key, value in eval_metadata:
+                del eval_metadata[key]
+                eval_metadata['eval/' + key] = value
+
+            if use_wandb: # todo: add gradient norm, token entropy
+                wandb.log(
+                    eval_metadata, 
+                    step=step
+                )
+            else:
+                print(f'step {step}, eval_metadata = {eval_metadata}')
+
+        # todo: periodically save model
+
+    # save the model weights
+    policy.save_pretrained(save_directory=output_dir)
+    tokenizer.save_pretrained(save_directory=output_dir)

@@ -1,6 +1,5 @@
-import pandas as pd
-from cs336_alignment.config import r1_zero_prompt
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.util import get_gsm8k
 from typing import Callable, List, Literal
 from vllm import LLM, SamplingParams
 
@@ -51,14 +50,7 @@ def gsm8k_baseline(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=['</answer>'], include_stop_str_in_output = True
     )
 
-    df = pd.read_json('data/gsm8k/test.jsonl', lines=True)
-    questions = df['question'].tolist()
-    answers = df['answer'].tolist()
-
-    if prompt_template == 'r1_zero':
-        questions = [r1_zero_prompt.format(question=q) for q in questions]
-
-    answers = [a.split('####')[1].lstrip() for a in answers]
+    questions, answers = get_gsm8k(prompt_template, 'test')
 
     evaluate_vllm(llm, sampling_params, r1_zero_reward_fn, questions, answers)
 

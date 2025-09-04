@@ -74,18 +74,18 @@ def compute_group_normalized_rewards(
             advantages[i * group_size : (i + 1) * group_size] /= rewards[i * group_size : (i + 1) * group_size].std() + advantage_eps
     
     metadata = {
-        'reward_max': rewards.max(),
-        'reward_min': rewards.min(),
+        # 'reward_max': rewards.max(),
+        # 'reward_min': rewards.min(),
         'reward_mean': rewards.mean(),
-        'reward_std': rewards.std(),
-        'format_reward_max': format_rewards.max(),
-        'format_reward_min': format_rewards.min(),
+        # 'reward_std': rewards.std(),
+        # 'format_reward_max': format_rewards.max(),
+        # 'format_reward_min': format_rewards.min(),
         'format_reward_mean': format_rewards.mean(),
-        'format_reward_std': format_rewards.std(),
-        'answer_reward_max': answer_rewards.max(),
-        'answer_reward_min': answer_rewards.min(),
+        # 'format_reward_std': format_rewards.std(),
+        # 'answer_reward_max': answer_rewards.max(),
+        # 'answer_reward_min': answer_rewards.min(),
         'answer_reward_mean': answer_rewards.mean(),
-        'answer_reward_std': answer_rewards.std()
+        # 'answer_reward_std': answer_rewards.std()
     }
 
     return (advantages, rewards, metadata)
@@ -292,9 +292,46 @@ def grpo_microbatch_train_step(
     return (loss, metadata)
 
 
+class GRPODataLoader():
+    def __init__(
+        self, 
+        questions: list[str], 
+        answers: list[str], 
+        micro_batch_size: int, 
+        group_size: int
+    ):
+        self.questions = questions
+        self.answers = answers
+        self.micro_batch_size = micro_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.group_size = group_size
+        self.index = 0
+        self._shuffle()
+
+    def _shuffle(self):
+        permutation = torch.randperm(len(self.questions)).tolist()
+        self.questions = [self.questions[p] for p in permutation]
+        self.answers = [self.answers[p] for p in permutation]
+
+    def get_micro_batch(self):
+        if self.index >= len(self.questions):
+            self.index = 0
+            self._shuffle()
+
+        micro_batch_questions = self.questions[self.index : self.index + self.micro_batch_size]
+        micro_batch_answers = self.answers[self.index : self.index + self.micro_batch_size]
+
+        repeated_micro_batch_questions = [q for q in micro_batch_questions for _ in range(self.group_size)]
+        repeated_micro_batch_answers = [a for a in micro_batch_answers for _ in range(self.group_size)]
+
+        self.index += self.micro_batch_size
+
+        return (repeated_micro_batch_questions, repeated_micro_batch_answers)
+
+
 if __name__ == '__main__':
-    model_id = 'Qwen/Qwen2.5-Math-1.5B'
-    # model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
+    # model_id = 'Qwen/Qwen2.5-Math-1.5B'
+    model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
     time = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
     output_dir = f'outputs/{model_id.split('/')[-1]}/{time}'
     os.makedirs(output_dir, exist_ok=True)
@@ -343,6 +380,7 @@ if __name__ == '__main__':
     )
     policy_model_device = 'cuda:0'
     policy.to(policy_model_device)
+    policy = torch.compile(policy)
     print(f'policy_model_device = {policy.device}')
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     optimizer = torch.optim.AdamW(
@@ -369,6 +407,8 @@ if __name__ == '__main__':
     assert len(validation_questions) == len(validation_answers)
     num_train_samples = len(train_questions)
     num_validation_samples = len(validation_questions)
+    train_dataloader = GRPODataLoader(train_questions, train_answers, micro_train_batch_size, group_size)
+    validation_dataloader = GRPODataLoader(validation_questions, validation_answers, micro_eval_batch_size, 1)
     
     print(num_train_samples)
     print(num_validation_samples)
@@ -427,12 +467,16 @@ if __name__ == '__main__':
 
             return metadata
 
+        all_input_ids = []
+        all_labels = []
+        all_response_mask = []
+        all_rewards = []
+        all_advantages = []
+        all_old_log_probs = []
+
         for gradient_accumulation_step in range(gradient_accumulation_steps):
             # sample a batch of questions D_b from D (microbatch version)
-            indices = random.sample(range(num_train_samples), micro_train_batch_size)
-            repeated_indices = [i for i in indices for _ in range(group_size)]
-            repeated_micro_batch_questions = [train_questions[i] for i in repeated_indices]
-            repeated_micro_batch_answers = [train_answers[i] for i in repeated_indices]
+            repeated_micro_batch_questions, repeated_micro_batch_answers = train_dataloader.get_micro_batch()
 
             # set the old policy model π_θ_old ← π_θ
             load_policy_into_vllm_instance(policy, vllm)
@@ -467,15 +511,23 @@ if __name__ == '__main__':
             input_ids = input_ids.to(policy_model_device)
             labels = labels.to(policy_model_device)
             response_mask = response_mask.to(policy_model_device)
+            rewards = rewards.to(policy_model_device)
+            advantages = advantages.to(policy_model_device)
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_response_mask.append(response_mask)
+            all_rewards.append(rewards)
+            all_advantages.append(advantages)
 
             policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
-            advantages = advantages.to(policy_model_device)
 
             # compute old_log_probs if loss_type == 'grpo_clip'
             old_log_probs = None
             if loss_type == 'grpo_clip':
                 with torch.inference_mode():
                     old_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+                    old_log_probs = old_log_probs.to(policy_model_device)
+                    all_old_log_probs.append(old_log_probs)
 
             advantages.unsqueeze_(-1)
             loss, temp_metadata = grpo_microbatch_train_step(
@@ -511,36 +563,46 @@ if __name__ == '__main__':
             # update the policy model π_θ by maximizing the GRPO-Clip objective
 
             if train_step != 0:
-                optimizer.zero_grad()
-                # todo: modify to compute over all input_ids and labels, not just those from the last accumulation step
-                policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
-                loss, train_step_metadata = compute_policy_gradient_loss(
-                    policy_log_probs,
-                    loss_type,
-                    rewards,
-                    advantages,
-                    old_log_probs,
-                    cliprange
-                )
-                loss.backward()
+                for gradient_accumulation_step in range(gradient_accumulation_steps):
+                    input_ids = all_input_ids[gradient_accumulation_step]
+                    labels = all_labels[gradient_accumulation_step]
+                    response_mask = all_response_mask[gradient_accumulation_step]
+                    rewards = all_rewards[gradient_accumulation_step]
+                    advantages = all_advantages[gradient_accumulation_step]
+
+                    policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+
+                    _, _ = grpo_microbatch_train_step(
+                        policy_log_probs,
+                        response_mask,
+                        gradient_accumulation_steps,
+                        loss_type,
+                        rewards,
+                        advantages,
+                        old_log_probs,
+                        cliprange
+                    )
 
             optimizer.step()
+            optimizer.zero_grad()
+
+        all_input_ids.clear()
+        all_labels.clear()
+        all_response_mask.clear()
+        all_rewards.clear()
+        all_advantages.clear()
+        all_old_log_probs.clear()
 
         if step % eval_steps == 0:
             eval_metadata = {}
             load_policy_into_vllm_instance(policy, vllm)
             for eval_accumulation_step in tqdm(range(num_validation_samples // micro_eval_batch_size), desc='eval accumulation'):
-                
-                # todo: modify to perform evaluation on the entire validation set instead of random sampling
-                
                 # sample a batch of questions D_b from D (microbatch version)
-                indices = random.sample(range(num_validation_samples), micro_eval_batch_size)
-                repeated_indices = [i for i in indices for _ in range(group_size)]
-                repeated_micro_batch_questions = [validation_questions[i] for i in repeated_indices]
-                repeated_micro_batch_answers = [validation_answers[i] for i in repeated_indices]
+                micro_batch_questions, micro_batch_answers = validation_dataloader.get_micro_batch()
 
-                # sample G outputs for each question q ∈ D_b
-                outputs = vllm.generate(repeated_micro_batch_questions, sampling_params, use_tqdm=False)
+                # during validation, sample only one output per q ∈ D_b
+                # therefore, the micro_batch_questions and micro_batch_answers are not repeated
+                outputs = vllm.generate(micro_batch_questions, sampling_params, use_tqdm=False)
                 prompts = [output.prompt for output in outputs]
                 responses = [output.outputs[0].text for output in outputs]
 
@@ -550,7 +612,7 @@ if __name__ == '__main__':
                 advantages, rewards, temp_metadata = compute_group_normalized_rewards(
                     reward_fn,
                     responses,
-                    repeated_micro_batch_answers,
+                    micro_batch_answers,
                     group_size,
                     advantage_eps,
                     normalize_by_std

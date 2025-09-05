@@ -41,10 +41,15 @@ def tokenize_prompt_and_output(
     labels = torch.full((batch_size, max_prompt_and_output_lens - 1), pad_token_id, dtype=torch.int64)
     response_mask = torch.zeros(batch_size, max_prompt_and_output_lens - 1, dtype=torch.int)
 
+    len_output_sum = 0
+    len_output_max = 0
+
     for i in range(batch_size):
         prompt, output = encoded_prompts[i], encoded_outputs[i]
         len_prompt = len(prompt)
         len_output = len(output)
+        len_output_sum += len_output
+        len_output_max = max(len_output_max, len_output)
         if len_prompt + len_output < max_prompt_and_output_lens - 1:
             input_ids[i, : len_prompt + len_output] = torch.tensor((prompt + output), dtype=torch.int)
         else:
@@ -56,7 +61,9 @@ def tokenize_prompt_and_output(
     return {
         'input_ids': input_ids,
         'labels': labels,
-        'response_mask': response_mask
+        'response_mask': response_mask,
+        'mean_response_len': len_output_sum / batch_size,
+        'max_response_len': len_output_max
     }
 
 

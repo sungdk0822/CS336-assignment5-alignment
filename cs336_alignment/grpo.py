@@ -467,6 +467,8 @@ if __name__ == '__main__':
         all_rewards = []
         all_advantages = []
         all_old_log_probs = []
+        mean_response_len = 0.0
+        max_response_len = 0
 
         for gradient_accumulation_step in tqdm(range(gradient_accumulation_steps), desc='train accumulation', leave=False, position=1):
             # sample a batch of questions D_b from D (microbatch version)
@@ -501,6 +503,8 @@ if __name__ == '__main__':
             # compute policy_log_probs
             result = tokenize_prompt_and_output(prompts, responses, tokenizer)
             input_ids, labels, response_mask = result['input_ids'], result['labels'], result['response_mask']
+            mean_response_len = (mean_response_len * gradient_accumulation_step + result['mean_response_len']) / (gradient_accumulation_step + 1)
+            max_response_len = max(max_response_len, result['max_response_len'])
 
             input_ids = input_ids.to(policy_model_device)
             labels = labels.to(policy_model_device)
@@ -540,7 +544,11 @@ if __name__ == '__main__':
             accumulated_loss += loss
             metadata = merge_metadata(metadata, temp_metadata, gradient_accumulation_step)
 
-        train_log = {}
+        train_log = {
+            'train/mean_response_len': mean_response_len,
+            'train/max_response_len': max_response_len
+        }
+        
         for key, value in metadata.items():
             train_log['train/' + key] = value
 
@@ -565,6 +573,7 @@ if __name__ == '__main__':
                     response_mask = all_response_mask[gradient_accumulation_step]
                     rewards = all_rewards[gradient_accumulation_step]
                     advantages = all_advantages[gradient_accumulation_step]
+                    old_log_probs = all_old_log_probs[gradient_accumulation_step]
 
                     policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
 

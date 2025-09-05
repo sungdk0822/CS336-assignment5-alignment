@@ -329,6 +329,8 @@ class GRPODataLoader():
         return (repeated_micro_batch_questions, repeated_micro_batch_answers)
 
 
+# for debugging
+# TORCH_USE_CUDA_DSA=1 CUDA_LAUNCH_BLOCKING=1 uv run python cs336_alignment/grpo.py
 if __name__ == '__main__':
     # model_id = 'Qwen/Qwen2.5-Math-1.5B'
     model_id = 'Qwen/Qwen2.5-0.5B-Instruct'
@@ -380,7 +382,6 @@ if __name__ == '__main__':
     )
     policy_model_device = 'cuda:0'
     policy.to(policy_model_device)
-    policy = torch.compile(policy)
     print(f'policy_model_device = {policy.device}')
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     optimizer = torch.optim.AdamW(
@@ -437,15 +438,8 @@ if __name__ == '__main__':
                 'cliprange': cliprange
             },
         )
-        # setup wandb metrics
-        wandb.define_metric("train_step") # the x‑axis for training
-        wandb.define_metric("eval_step") # the x‑axis for evaluation
-        # everything that starts with train/ is tied to train_step
-        wandb.define_metric("train/*", step_metric="train_step")
-        # everything that starts with eval/ is tied to eval_step
-        wandb.define_metric("eval/*", step_metric="eval_step")
 
-    for step in tqdm(range(n_grpo_steps)):
+    for step in tqdm(range(n_grpo_steps), desc='step', leave=True, position=0):
         accumulated_loss = 0.0
         metadata = {}
 
@@ -474,7 +468,7 @@ if __name__ == '__main__':
         all_advantages = []
         all_old_log_probs = []
 
-        for gradient_accumulation_step in range(gradient_accumulation_steps):
+        for gradient_accumulation_step in tqdm(range(gradient_accumulation_steps), desc='train accumulation', leave=False, position=1):
             # sample a batch of questions D_b from D (microbatch version)
             repeated_micro_batch_questions, repeated_micro_batch_answers = train_dataloader.get_micro_batch()
 
@@ -511,13 +505,15 @@ if __name__ == '__main__':
             input_ids = input_ids.to(policy_model_device)
             labels = labels.to(policy_model_device)
             response_mask = response_mask.to(policy_model_device)
-            rewards = rewards.to(policy_model_device)
-            advantages = advantages.to(policy_model_device)
             all_input_ids.append(input_ids)
             all_labels.append(labels)
             all_response_mask.append(response_mask)
-            all_rewards.append(rewards)
-            all_advantages.append(advantages)
+            if rewards is not None:
+                rewards = rewards.to(policy_model_device)
+                all_rewards.append(rewards)
+            if advantages is not None:
+                advantages = advantages.to(policy_model_device)
+                all_advantages.append(advantages)
 
             policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
 
@@ -596,7 +592,7 @@ if __name__ == '__main__':
         if step % eval_steps == 0:
             eval_metadata = {}
             load_policy_into_vllm_instance(policy, vllm)
-            for eval_accumulation_step in tqdm(range(num_validation_samples // micro_eval_batch_size), desc='eval accumulation'):
+            for eval_accumulation_step in tqdm(range(num_validation_samples // micro_eval_batch_size), desc='eval accumulation', leave=False, position=2):
                 # sample a batch of questions D_b from D (microbatch version)
                 micro_batch_questions, micro_batch_answers = validation_dataloader.get_micro_batch()
 
@@ -613,7 +609,7 @@ if __name__ == '__main__':
                     reward_fn,
                     responses,
                     micro_batch_answers,
-                    group_size,
+                    1,
                     advantage_eps,
                     normalize_by_std
                 )

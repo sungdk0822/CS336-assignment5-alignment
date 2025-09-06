@@ -69,7 +69,7 @@ def compute_group_normalized_rewards(
     
     for i in range(advantages.size(0) // group_size):
         advantages[i * group_size : (i + 1) * group_size] -= rewards[i * group_size : (i + 1) * group_size].mean()
-        if normalize_by_std:
+        if normalize_by_std and group_size > 1:
             advantages[i * group_size : (i + 1) * group_size] /= rewards[i * group_size : (i + 1) * group_size].std() + advantage_eps
     
     metadata = {
@@ -337,7 +337,7 @@ if __name__ == '__main__':
     output_dir = f'outputs/{model_id.split('/')[-1]}/{time}'
     os.makedirs(output_dir, exist_ok=True)
 
-    n_grpo_steps: int = 200
+    n_grpo_steps: int = 100
     eval_steps: int = 10
     learning_rate: float = 1e-5
     advantage_eps: float = 1e-6
@@ -346,8 +346,8 @@ if __name__ == '__main__':
     sampling_temperature: float = 1.0
     sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
     sampling_max_tokens: int = 512
-    epochs_per_rollout_batch: int = 1 # On-policy
-    train_batch_size: int = 256 # On-policy
+    epochs_per_rollout_batch: int = 3
+    train_batch_size: int = 256
     micro_eval_batch_size: int = 16
     gradient_accumulation_steps: int = 128 # microbatch size is 2, will fit on H100
     gpu_memory_utilization: float = 0.1
@@ -355,7 +355,7 @@ if __name__ == '__main__':
         'no_baseline',
         'reinforce_with_baseline',
         'grpo_clip',
-    ] = 'reinforce_with_baseline'
+    ] = 'grpo_clip'
     use_std_normalization: bool = True
     cliprange: float = 0.1
     use_wandb: bool = True
@@ -468,6 +468,7 @@ if __name__ == '__main__':
         all_old_log_probs = []
         mean_response_len = 0.0
         max_response_len = 0
+        generation_entropy = 0.0
 
         for gradient_accumulation_step in tqdm(range(gradient_accumulation_steps), desc='train accumulation', leave=False, position=1):
             # sample a batch of questions D_b from D (microbatch version)
@@ -513,14 +514,14 @@ if __name__ == '__main__':
             all_response_mask.append(response_mask)
             if rewards is not None:
                 rewards = rewards.to(policy_model_device)
-                all_rewards.append(rewards)
+            all_rewards.append(rewards)
             if advantages is not None:
                 advantages = advantages.to(policy_model_device)
-                all_advantages.append(advantages)
+            all_advantages.append(advantages)
 
             result = get_response_log_probs(policy, input_ids, labels, True)
             policy_log_probs, token_entropy = result['log_probs'], result['token_entropy']
-            generation_entropy = (token_entropy * response_mask).mean().item()
+            generation_entropy = (generation_entropy * gradient_accumulation_step + (token_entropy * response_mask).mean().item()) / (gradient_accumulation_step + 1)
 
             # compute old_log_probs if loss_type == 'grpo_clip'
             old_log_probs = None

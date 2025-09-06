@@ -1,5 +1,4 @@
 import os
-import random
 import torch
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
@@ -519,7 +518,9 @@ if __name__ == '__main__':
                 advantages = advantages.to(policy_model_device)
                 all_advantages.append(advantages)
 
-            policy_log_probs = get_response_log_probs(policy, input_ids, labels)['log_probs']
+            result = get_response_log_probs(policy, input_ids, labels, True)
+            policy_log_probs, token_entropy = result['log_probs'], result['token_entropy']
+            generation_entropy = (token_entropy * response_mask).mean().item()
 
             # compute old_log_probs if loss_type == 'grpo_clip'
             old_log_probs = None
@@ -546,13 +547,14 @@ if __name__ == '__main__':
 
         train_log = {
             'train/mean_response_len': mean_response_len,
-            'train/max_response_len': max_response_len
+            'train/max_response_len': max_response_len,
+            'train/generation_entropy': generation_entropy
         }
         
         for key, value in metadata.items():
             train_log['train/' + key] = value
 
-        if use_wandb: # todo: add gradient norm, token entropy
+        if use_wandb: # todo: add gradient norm
             wandb.log(
                 train_log, 
                 step=step
